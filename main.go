@@ -1,14 +1,59 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"text/template"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v3"
 )
+
+type HtmlData struct {
+	Css string
+	Js  string
+}
+
+//go:embed index.html.tmpl
+var indexHtml string
+
+//go:embed index.css
+var indexCss string
+
+//go:embed index.js
+var indexJs string
+
+//go:embed client.html.tmpl
+var clientHtml string
+
+//go:embed client.js
+var clientJs string
+
+//go:embed whip.js
+var whipJs string
+
+func getIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/whip.js" {
+		w.Write([]byte(whipJs))
+	} else if r.URL.Path == "/" {
+		hd := HtmlData{indexCss, indexJs}
+		t := template.Must(template.New("index").Parse(indexHtml))
+		err := t.Execute(w, hd)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		hd := HtmlData{indexCss, clientJs}
+		t := template.Must(template.New("client").Parse(clientHtml))
+		err := t.Execute(w, hd)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
 
 func main() {
 	pcs := make(map[string]*webrtc.PeerConnection)
@@ -18,7 +63,8 @@ func main() {
 		id := r.URL.Path[len("/"):]
 		switch r.Method {
 		case http.MethodGet:
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			getIndex(w, r)
+			return
 
 		case http.MethodPost:
 			// WHIP create

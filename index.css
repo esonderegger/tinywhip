@@ -1,0 +1,49 @@
+body {
+  background-color: #494949;
+  color: #ffffff;
+  font-family: sans-serif;
+  padding: 0;
+  margin: 0;
+  text-align: center;
+  display: flex;
+  flex-flow: column;
+  height: 100vh;
+  justify-content: space-between;
+}
+
+header {
+  height: 4rem;
+  line-height: 4rem;
+  font-size: 1.2rem;
+}
+
+main {
+  max-height: calc(100% - 8rem);
+}
+
+video {
+  max-height: 100%;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+footer {
+  height: 4rem;
+  line-height: 4rem;
+}
+
+.video-container {
+  aspect-ratio: 16 / 9;
+  background-color: #000;
+  margin: 1rem 0;
+  overflow: hidden;
+}
+
+.button {
+  border: none;
+  cursor: pointer;
+  color: #ffffff;
+  background-color: #0e3e8b;
+  padding: 0.75rem;
+  border-radius: 0.25rem;
+}
