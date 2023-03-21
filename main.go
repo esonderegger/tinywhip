@@ -6,9 +6,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"text/template"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -17,56 +20,57 @@ type HtmlData struct {
 	Js  string
 }
 
-//go:embed index.html.tmpl
-var indexHtml string
+//go:embed tinywhip.css
+var tinywhipCss string
 
-//go:embed index.css
-var indexCss string
+//go:embed whip.html.tmpl
+var whipHtml string
 
-//go:embed index.js
-var indexJs string
-
-//go:embed client.html.tmpl
-var clientHtml string
-
-//go:embed client.js
-var clientJs string
+//go:embed whep.html.tmpl
+var whepHtml string
 
 //go:embed whip.js
 var whipJs string
 
+//go:embed whep.js
+var whepJs string
+
 func getIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/whip.js" {
-		w.Write([]byte(whipJs))
-	} else if r.URL.Path == "/" {
-		hd := HtmlData{indexCss, indexJs}
-		t := template.Must(template.New("index").Parse(indexHtml))
+	if strings.HasPrefix(r.URL.Path, "/whip/") {
+		hd := HtmlData{tinywhipCss, whipJs}
+		t := template.Must(template.New("index").Parse(whipHtml))
+		err := t.Execute(w, hd)
+		if err != nil {
+			panic(err)
+		}
+	} else if strings.HasPrefix(r.URL.Path, "/whep/") {
+		hd := HtmlData{tinywhipCss, whepJs}
+		t := template.Must(template.New("client").Parse(whepHtml))
 		err := t.Execute(w, hd)
 		if err != nil {
 			panic(err)
 		}
 	} else {
-		hd := HtmlData{indexCss, clientJs}
-		t := template.Must(template.New("client").Parse(clientHtml))
-		err := t.Execute(w, hd)
-		if err != nil {
-			panic(err)
-		}
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 }
 
 func main() {
 	pcs := make(map[string]*webrtc.PeerConnection)
+	streams := make(map[string][]*webrtc.TrackLocalStaticRTP)
 	tracks := []*webrtc.TrackLocalStaticRTP{}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Path[len("/"):]
+		id := r.URL.Path[len("/whip/"):]
 		switch r.Method {
 		case http.MethodGet:
 			getIndex(w, r)
 			return
 
 		case http.MethodPost:
+			log.Printf("Got a post request: %s", r.URL.Path)
+			// id := r.URL.Path[len("/whip/"):]
 			// WHIP create
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -75,7 +79,7 @@ func main() {
 			}
 
 			pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-				ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+				ICEServers: []webrtc.ICEServer{},
 			})
 			if err != nil {
 				log.Printf("Failed to create peer connection: %s", err)
@@ -87,28 +91,61 @@ func main() {
 				log.Printf("Connection State has changed %s", connectionState.String())
 			})
 
-			if id != "" {
+			// if id != "" {
+			if strings.HasPrefix(r.URL.Path, "/whep/") {
 				// WHEP create
-				for _, t := range tracks {
-					if t.StreamID() != id {
-						continue
-					}
-					log.Printf("Adding track: %s", t.StreamID())
+				stream, ok := streams[id]
+				if ok {
+					for _, t := range stream {
+						log.Printf("Adding track: %s", t.StreamID())
 
-					if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
-						log.Printf("Failed to add track: %s", err)
-						return
+						if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
+							log.Printf("Failed to add track: %s", err)
+							return
+						}
 					}
+				} else {
+					w.WriteHeader(http.StatusNotFound)
+					return
 				}
-			} else {
+
+				// for _, t := range tracks {
+				// 	if t.StreamID() != id {
+				// 		continue
+				// 	}
+				// 	log.Printf("Adding track: %s", t.StreamID())
+
+				// 	if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
+				// 		log.Printf("Failed to add track: %s", err)
+				// 		return
+				// 	}
+				// }
+				// } else {
+			} else if strings.HasPrefix(r.URL.Path, "/whip/") {
 				pc.OnTrack(func(tr *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 					log.Printf("Got track: %s", tr.StreamID())
+					log.Printf("Other info: %s", tr.ID())
 
 					tl, err := webrtc.NewTrackLocalStaticRTP(tr.Codec().RTPCodecCapability, tr.ID(), tr.StreamID())
 					if err != nil {
 						log.Printf("Failed to create track: %s", err)
 						return
 					}
+					stream, ok := streams[id]
+					if ok {
+						stream = append(stream, tl)
+					} else {
+						streams[id] = []*webrtc.TrackLocalStaticRTP{tl}
+					}
+					go func() {
+						ticker := time.NewTicker(time.Second * 2)
+						for range ticker.C {
+							errSend := pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(tr.SSRC())}})
+							if errSend != nil {
+								fmt.Println(errSend)
+							}
+						}
+					}()
 
 					tracks = append(tracks, tl)
 					defer func() {
@@ -132,6 +169,9 @@ func main() {
 						}
 					}
 				})
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+				return
 			}
 
 			gatherComplete := webrtc.GatheringCompletePromise(pc)
@@ -177,7 +217,7 @@ func main() {
 			pcid := uuid.NewString()
 
 			w.Header().Set("Content-Type", "application/sdp")
-			w.Header().Set("Location", fmt.Sprintf("http://%s/%s", r.Host, pcid))
+			w.Header().Set("Location", fmt.Sprintf("http://%s/%s", r.Host, id))
 
 			if _, err := w.Write([]byte(pc.LocalDescription().SDP)); err != nil {
 				log.Printf("Failed to write response: %s", err)

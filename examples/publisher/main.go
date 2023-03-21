@@ -21,7 +21,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	x264Params.BitRate = 500_000
+	x264Params.BitRate = 5_500_000
 
 	codecSelector := mediadevices.NewCodecSelector(
 		mediadevices.WithVideoEncoders(&x264Params),
@@ -30,9 +30,7 @@ func main() {
 	mediaEngine := webrtc.MediaEngine{}
 	codecSelector.Populate(&mediaEngine)
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
-	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-	})
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		panic(err)
 	}
@@ -44,8 +42,8 @@ func main() {
 	s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
-			c.Width = prop.Int(640)
-			c.Height = prop.Int(480)
+			c.Width = prop.Int(1280)
+			c.Height = prop.Int(720)
 		},
 		Codec: codecSelector,
 	})
