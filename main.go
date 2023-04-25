@@ -2,15 +2,16 @@ package main
 
 import (
 	_ "embed"
+
 	"fmt"
-	"io"
-	"log"
+	"io/ioutil"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 )
@@ -35,238 +36,236 @@ var whipJs string
 //go:embed whep.js
 var whepJs string
 
-func getIndex(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/whip/") {
-		hd := HtmlData{tinywhipCss, whipJs}
-		t := template.Must(template.New("index").Parse(whipHtml))
-		err := t.Execute(w, hd)
-		if err != nil {
-			panic(err)
+var pcConfig *webrtc.Configuration
+var pcs map[string]*webrtc.PeerConnection
+var streams map[string][]*webrtc.TrackLocalStaticRTP
+
+func getPortFromEnv(key string, fallback int) int {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		return fallback
+	}
+	intVar, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return intVar
+}
+
+// Read incoming RTCP packets
+// Before these packets are returned they are processed by interceptors. For things
+// like NACK this needs to be called.
+func readRtcpFromSender(sender *webrtc.RTPSender) {
+	rtcpBuf := make([]byte, 1500)
+	for {
+		if _, _, rtcpErr := sender.Read(rtcpBuf); rtcpErr != nil {
+			return
 		}
-	} else if strings.HasPrefix(r.URL.Path, "/whep/") {
-		hd := HtmlData{tinywhipCss, whepJs}
-		t := template.Must(template.New("client").Parse(whepHtml))
-		err := t.Execute(w, hd)
+	}
+}
+
+func getWhipStream(w http.ResponseWriter, req *http.Request) {
+	hd := HtmlData{tinywhipCss, whipJs}
+	t := template.Must(template.New("index").Parse(whipHtml))
+	err := t.Execute(w, hd)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func getWhepStream(w http.ResponseWriter, req *http.Request) {
+	hd := HtmlData{tinywhipCss, whepJs}
+	t := template.Must(template.New("index").Parse(whepHtml))
+	err := t.Execute(w, hd)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func postWhipStream(w http.ResponseWriter, req *http.Request) {
+	id := req.URL.Path[len("/whip/"):]
+	fmt.Printf("Got WHIP request: %s\n", id)
+
+	// If previous WHIP sender failed to send DELETE, clean up now.
+	delete(streams, id)
+	reqBody, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, "Problem reading WHIP request body", http.StatusBadRequest)
+		return
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  string(reqBody),
+	}
+
+	pc, err := webrtc.NewPeerConnection(*pcConfig)
+	if err != nil {
+		panic(err)
+	}
+	pc.OnTrack(func(tr *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		fmt.Printf("Got track: %s\n", tr.StreamID())
+		fmt.Printf("Codec info: %s\n", tr.Codec().MimeType)
+
+		tl, err := webrtc.NewTrackLocalStaticRTP(tr.Codec().RTPCodecCapability, tr.ID(), tr.StreamID())
 		if err != nil {
-			panic(err)
+			fmt.Printf("Failed to create track: %s\n", err)
+			return
+		}
+		stream, ok := streams[id]
+		if ok {
+			stream = append(stream, tl)
+		} else {
+			streams[id] = []*webrtc.TrackLocalStaticRTP{tl}
+		}
+		go func() {
+			ticker := time.NewTicker(time.Second * 2)
+			for range ticker.C {
+				errSend := pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(tr.SSRC())}})
+				if errSend != nil {
+					fmt.Println(errSend)
+				}
+			}
+		}()
+
+		for {
+			p, _, err := tr.ReadRTP()
+			if err != nil {
+				fmt.Printf("Failed to read RTP: %s\n", err)
+				return
+			}
+			if err := tl.WriteRTP(p); err != nil {
+				fmt.Printf("Failed to write RTP: %s\n", err)
+				return
+			}
+		}
+	})
+	if err = pc.SetRemoteDescription(offer); err != nil {
+		panic(err)
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		panic(err)
+	}
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	if err = pc.SetLocalDescription(answer); err != nil {
+		panic(err)
+	}
+	<-gatherComplete
+	w.Header().Set("Content-Type", "application/sdp")
+	fmt.Fprintf(w, pc.LocalDescription().SDP)
+}
+
+func postWhepStream(w http.ResponseWriter, req *http.Request) {
+	id := req.URL.Path[len("/whep/"):]
+	fmt.Printf("Got WHEP request: %s\n", id)
+	reqBody, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, "Problem reading WHEP request body", http.StatusBadRequest)
+		return
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  string(reqBody),
+	}
+
+	pc, err := webrtc.NewPeerConnection(*pcConfig)
+	if err != nil {
+		panic(err)
+	}
+
+	stream, ok := streams[id]
+	if ok {
+		for _, t := range stream {
+			fmt.Printf("Adding track: %s\n", t.StreamID())
+
+			if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
+				fmt.Printf("Failed to add track: %s\n", err)
+				return
+			}
 		}
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		fmt.Printf("Connection State has changed %s \n", connectionState.String())
+
+		if connectionState == webrtc.ICEConnectionStateFailed {
+			if closeErr := pc.Close(); closeErr != nil {
+				panic(closeErr)
+			}
+		}
+	})
+	if err = pc.SetRemoteDescription(offer); err != nil {
+		panic(err)
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		panic(err)
+	}
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	if err = pc.SetLocalDescription(answer); err != nil {
+		panic(err)
+	}
+	<-gatherComplete
+	w.Header().Set("Content-Type", "application/sdp")
+	fmt.Fprintf(w, pc.LocalDescription().SDP)
+}
+
+func handleWhip(w http.ResponseWriter, req *http.Request) {
+	switch req.Method {
+	case "GET":
+		getWhipStream(w, req)
+		return
+	case "POST":
+		postWhipStream(w, req)
+		return
+	default:
+		http.Error(w, "404 not found.", http.StatusNotFound)
+		return
+	}
+}
+
+func handleWhep(w http.ResponseWriter, req *http.Request) {
+	switch req.Method {
+	case "GET":
+		getWhepStream(w, req)
+		return
+	case "POST":
+		postWhepStream(w, req)
+		return
+	default:
+		http.Error(w, "404 not found.", http.StatusNotFound)
+		return
+	}
+}
+
+func router(w http.ResponseWriter, req *http.Request) {
+	if strings.HasPrefix(req.URL.Path, "/whip/") {
+		handleWhip(w, req)
+		return
+	}
+	if strings.HasPrefix(req.URL.Path, "/whep/") {
+		handleWhep(w, req)
+		return
+	}
+	http.Error(w, "404 not found.", http.StatusNotFound)
+	return
 }
 
 func main() {
-	pcs := make(map[string]*webrtc.PeerConnection)
-	streams := make(map[string][]*webrtc.TrackLocalStaticRTP)
-	tracks := []*webrtc.TrackLocalStaticRTP{}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Path[len("/whip/"):]
-		switch r.Method {
-		case http.MethodGet:
-			getIndex(w, r)
-			return
-
-		case http.MethodPost:
-			log.Printf("Got a post request: %s", r.URL.Path)
-			// id := r.URL.Path[len("/whip/"):]
-			// WHIP create
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-				ICEServers: []webrtc.ICEServer{},
-			})
-			if err != nil {
-				log.Printf("Failed to create peer connection: %s", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-				log.Printf("Connection State has changed %s", connectionState.String())
-			})
-
-			// if id != "" {
-			if strings.HasPrefix(r.URL.Path, "/whep/") {
-				// WHEP create
-				stream, ok := streams[id]
-				if ok {
-					for _, t := range stream {
-						log.Printf("Adding track: %s", t.StreamID())
-
-						if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
-							log.Printf("Failed to add track: %s", err)
-							return
-						}
-					}
-				} else {
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
-
-				// for _, t := range tracks {
-				// 	if t.StreamID() != id {
-				// 		continue
-				// 	}
-				// 	log.Printf("Adding track: %s", t.StreamID())
-
-				// 	if _, err := pc.AddTransceiverFromTrack(t, webrtc.RtpTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}); err != nil {
-				// 		log.Printf("Failed to add track: %s", err)
-				// 		return
-				// 	}
-				// }
-				// } else {
-			} else if strings.HasPrefix(r.URL.Path, "/whip/") {
-				pc.OnTrack(func(tr *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-					log.Printf("Got track: %s", tr.StreamID())
-					log.Printf("Other info: %s", tr.ID())
-
-					tl, err := webrtc.NewTrackLocalStaticRTP(tr.Codec().RTPCodecCapability, tr.ID(), tr.StreamID())
-					if err != nil {
-						log.Printf("Failed to create track: %s", err)
-						return
-					}
-					stream, ok := streams[id]
-					if ok {
-						stream = append(stream, tl)
-					} else {
-						streams[id] = []*webrtc.TrackLocalStaticRTP{tl}
-					}
-					go func() {
-						ticker := time.NewTicker(time.Second * 2)
-						for range ticker.C {
-							errSend := pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(tr.SSRC())}})
-							if errSend != nil {
-								fmt.Println(errSend)
-							}
-						}
-					}()
-
-					tracks = append(tracks, tl)
-					defer func() {
-						for i, t := range tracks {
-							if t == tl {
-								tracks = append(tracks[:i], tracks[i+1:]...)
-								break
-							}
-						}
-					}()
-
-					for {
-						p, _, err := tr.ReadRTP()
-						if err != nil {
-							log.Printf("Failed to read RTP: %s", err)
-							return
-						}
-						if err := tl.WriteRTP(p); err != nil {
-							log.Printf("Failed to write RTP: %s", err)
-							return
-						}
-					}
-				})
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-
-			gatherComplete := webrtc.GatheringCompletePromise(pc)
-
-			if len(body) > 0 {
-				if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-					Type: webrtc.SDPTypeOffer,
-					SDP:  string(body),
-				}); err != nil {
-					log.Printf("Failed to set remote description: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-
-				answer, err := pc.CreateAnswer(nil)
-				if err != nil {
-					log.Printf("Failed to create answer: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-
-				if err := pc.SetLocalDescription(answer); err != nil {
-					log.Printf("Failed to set local description: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-			} else {
-				offer, err := pc.CreateOffer(nil)
-				if err != nil {
-					log.Printf("Failed to create offer: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-
-				if err := pc.SetLocalDescription(offer); err != nil {
-					log.Printf("Failed to set local description: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-			}
-			<-gatherComplete
-
-			pcid := uuid.NewString()
-
-			w.Header().Set("Content-Type", "application/sdp")
-			w.Header().Set("Location", fmt.Sprintf("http://%s/%s", r.Host, id))
-
-			if _, err := w.Write([]byte(pc.LocalDescription().SDP)); err != nil {
-				log.Printf("Failed to write response: %s", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			pcs[pcid] = pc
-		case http.MethodPatch:
-			if r.Header.Get("Content-Type") != "application/sdp" {
-				// Trickle ICE/ICE restart not implemented
-				panic("Not implemented")
-			}
-
-			pc, ok := pcs[id]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-				Type: webrtc.SDPTypeAnswer,
-				SDP:  string(body),
-			}); err != nil {
-				log.Printf("Failed to set remote description: %s", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		case http.MethodDelete:
-			pc, ok := pcs[id]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-
-			if err := pc.Close(); err != nil {
-				log.Printf("Failed to close peer connection: %s", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			delete(pcs, id)
-		}
-	})
-
-	panic(http.ListenAndServe(":8080", nil))
+	pcConfigAlt := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{},
+	}
+	pcConfig = &pcConfigAlt
+	pcs = make(map[string]*webrtc.PeerConnection)
+	streams = make(map[string][]*webrtc.TrackLocalStaticRTP)
+	http.HandleFunc("/", router)
+	httpPort := getPortFromEnv("WHEP_PORT", 8080)
+	port := ":" + strconv.Itoa(httpPort)
+	fmt.Fprintf(os.Stdout, "Serving on http://localhost%s\n", port)
+	http.ListenAndServe(port, nil)
 }
